@@ -1,31 +1,67 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# pose_direction_landmarker_pi.py  (Tilt-compensated version)
+# pose_direction_landmarker_pi.py — Pi-optimized, guided calibration (L/R/Up/Down), camera-tilt compensation
 
-import os, cv2, time, math, json
+import os, cv2, time, math, json, sys
 import numpy as np
 from collections import deque
 from PIL import ImageFont, ImageDraw, Image
 
-# ---------- Paths ----------
+# ---------------- Paths & Files ----------------
 HERE = os.path.dirname(__file__)
 MODEL_PATH = os.path.join(HERE, "models", "face_landmarker.task")
 FONT_PATH  = os.path.join(HERE, "THSarabunNew.ttf")
+CFG_PATH   = os.path.join(HERE, "face_config.json")
 
-# ---------- Camera ----------
+# ---------------- Camera ----------------
 CAM_INDEX = 0
 FRAME_W, FRAME_H, TARGET_FPS = 640, 480, 30
-# ถ้ากล้องติดตั้งเอียงแบบถาวร ใส่ค่าตรงนี้ (องศา, + = หมุนตามเข็มนาฬิกา)
-CAMERA_ROLL_DEG = 0.0
+DEFAULT_CAMERA_ROLL_DEG = 0.0   # ถ้ากล้องติดตั้งเอียงถาวรใส่ที่นี่ (+ ตามเข็ม)
 
-# ---------- Thresholds / Filters ----------
-YAW_ENTER_DEG = 20;  YAW_EXIT_DEG = 12
-PITCH_UP_ENTER_DEG = 12;  PITCH_UP_EXIT_DEG = 7
-PITCH_DOWN_ENTER_DEG = -12; PITCH_DOWN_EXIT_DEG = -7
-EMA_A = 0.25
-DEPTH_DELTA = 0.15
+# ---------------- Defaults (จะถูก override ด้วย config) ----------------
+CFG = {
+    # hysteresis (องศา) — จะถูกคำนวณใหม่อัตโนมัติจาก guided calibration
+    "YAW_ENTER_DEG": 20.0, "YAW_EXIT_DEG": 12.0,
+    "PITCH_UP_ENTER_DEG": 12.0, "PITCH_UP_EXIT_DEG": 7.0,
+    "PITCH_DOWN_ENTER_DEG": -12.0, "PITCH_DOWN_EXIT_DEG": -7.0,
 
-# ---------- Draw helpers ----------
+    # กำหนดสัดส่วนจากค่าที่วัดได้ในการคาลิเบรต → ค่าจริงที่ใช้เป็น threshold
+    "ENTER_RATIO": 0.60,   # 60% ขององศาที่หันสุดตอนคาลิเบรต
+    "EXIT_RATIO":  0.60,   # 60% ของ ENTER → ให้กลับสู่ center ง่ายขึ้น
+
+    # smoothing & depth
+    "EMA_A": 0.25,
+    "DEPTH_DELTA": 0.15,
+
+    # camera / bias
+    "camera_roll_deg": DEFAULT_CAMERA_ROLL_DEG,
+    "yaw_bias": 0.0, "pitch_bias": 0.0,
+
+    # speed profile
+    "SPEED_STEP": 10,
+
+    # UI / perf
+    "show_points": True,
+    "perf_overlay": True,   # ปิดด้วยปุ่ม p
+    "mirror": True
+}
+
+# ---------------- Save/Load config ----------------
+def load_cfg():
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            CFG.update(json.load(f))
+    except Exception:
+        pass
+
+def save_cfg():
+    try:
+        with open(CFG_PATH, "w", encoding="utf-8") as f:
+            json.dump(CFG, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+# ---------------- Draw helpers ----------------
 def draw_text_thai(img_bgr, text, xy, font_size=28, color=(255,255,255), stroke=2, stroke_color=(0,0,0)):
     try: font = ImageFont.truetype(FONT_PATH, font_size)
     except:  font = ImageFont.load_default()
@@ -42,11 +78,11 @@ def draw_panel(img_bgr, p1, p2, color=(0,0,0), alpha=0.55):
     cv2.rectangle(overlay, (x1,y1), (x2,y2), color, -1)
     return cv2.addWeighted(overlay, alpha, img_bgr, 1-alpha, 0)
 
-def ema(prev, new, a=EMA_A): return new if prev is None else prev*(1-a)+new*a
+# ---------------- Math ----------------
+def ema(prev, new, a): return new if prev is None else prev*(1-a)+new*a
 
-# ---------- Pose math ----------
 def rot_to_euler_deg(R):
-    """Extract pitch(+up), yaw(+right), roll from rotation matrix."""
+    # pitch(+up), yaw(+right), roll
     sy = math.sqrt(R[0,0]**2 + R[1,0]**2)
     singular = sy < 1e-6
     if not singular:
@@ -54,28 +90,25 @@ def rot_to_euler_deg(R):
         yaw   = math.degrees(math.atan2(-R[2,0], sy))
         roll  = math.degrees(math.atan2(R[1,0], R[0,0]))
     else:
-        pitch = math.degrees(math.atan2(-R[1,2], R[1,1]))
-        yaw   = math.degrees(math.atan2(-R[2,0], sy))
-        roll  = 0.0
+        pitch = math.degrees(math.atan2(-R[1,2], R[1,1])); yaw = math.degrees(math.atan2(-R[2,0], sy)); roll = 0.0
     return pitch, yaw, roll
 
 def Rz_deg(deg):
-    rad = math.radians(deg)
-    c, s = math.cos(rad), math.sin(rad)
+    rad = math.radians(deg); c,s = math.cos(rad), math.sin(rad)
     return np.array([[c,-s,0],[s,c,0],[0,0,1]], dtype=np.float64)
 
-# ---------- 3D model & landmark indices ----------
+# ---------------- 3D model & indices ----------------
 MODEL_3D = np.array([
     (  0.0,   0.0,   0.0),   # nose tip
     (  0.0, -63.6, -12.5),   # chin
     (-43.3,  32.7, -26.0),   # left eye outer
     ( 43.3,  32.7, -26.0),   # right eye outer
-    (-28.9, -28.9, -24.1),   # left mouth corner
-    ( 28.9, -28.9, -24.1),   # right mouth corner
+    (-28.9, -28.9, -24.1),   # left mouth
+    ( 28.9, -28.9, -24.1),   # right mouth
 ], dtype=np.float64)
 IDX_NOSE=4; IDX_CHIN=152; IDX_LEFT_EYE_OUT=263; IDX_RIGHT_EYE_OUT=33; IDX_LEFT_MOUTH=291; IDX_RIGHT_MOUTH=61
 
-# ---------- MediaPipe Tasks ----------
+# ---------------- MediaPipe Tasks ----------------
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 from mediapipe import Image as MPImage
@@ -91,42 +124,156 @@ def build_landmarker(model_path: str):
     )
     return mp_vision.FaceLandmarker.create_from_options(opts)
 
+# ---------------- Calibration helper ----------------
+class GuidedCalib:
+    """
+    ขั้นตอน: center -> left -> right -> up -> down -> done
+    จะคำนวณ hysteresis จากค่าที่วัดได้และบันทึกใน CFG
+    """
+    STEPS = ["center","left","right","up","down"]
+    def __init__(self): self.reset()
+
+    def reset(self):
+        self.active = False
+        self.step_i = 0
+        self.samples = {k: [] for k in self.STEPS}
+        self.baselined = False
+
+    def start(self):
+        self.reset(); self.active = True
+
+    def current_step(self): return self.STEPS[self.step_i] if self.active and self.step_i < len(self.STEPS) else None
+
+    def feed(self, yaw_c, pitch_c, roll_corr, eye_w, baseline_eye_w):
+        if not self.active: return
+        step = self.current_step()
+        if step is None: return
+        # เก็บเฉพาะค่านิ่ง ๆ
+        self.samples[step].append((yaw_c, pitch_c, roll_corr, eye_w, baseline_eye_w))
+        # เก็บประมาณ 40 เฟรมต่อขั้น
+        if len(self.samples[step]) >= 40:
+            self.step_i += 1
+            if self.step_i >= len(self.STEPS):
+                self.finish()
+
+    def finish(self):
+        # คำนวณค่าเฉลี่ย
+        avg = {}
+        for k, arr in self.samples.items():
+            if len(arr) == 0: continue
+            arr = np.array(arr, dtype=np.float64)
+            avg[k] = {
+                "yaw":   float(np.mean(arr[:,0])),
+                "pitch": float(np.mean(arr[:,1])),
+                "roll":  float(np.mean(arr[:,2])),
+                "eye_w": float(np.mean(arr[:,3])),
+                "base" : float(np.mean(arr[:,4])) if np.all(~np.isnan(arr[:,4])) else None
+            }
+
+        # ตั้ง bias: ใช้ค่ากลางเป็นศูนย์
+        if "center" in avg:
+            CFG["yaw_bias"]   = CFG.get("yaw_bias",0.0)   + avg["center"]["yaw"]
+            CFG["pitch_bias"] = CFG.get("pitch_bias",0.0) + avg["center"]["pitch"]
+            # roll bias ของกล้อง
+            CFG["camera_roll_deg"] = float(CFG.get("camera_roll_deg",0.0) + avg["center"]["roll"])
+            # baseline eye width
+            if avg["center"]["eye_w"]>0: self.center_eye_w = avg["center"]["eye_w"]
+        else:
+            self.center_eye_w = None
+
+        # สร้าง hysteresis
+        ENTER_RATIO = float(CFG.get("ENTER_RATIO",0.60))
+        EXIT_RATIO  = float(CFG.get("EXIT_RATIO", 0.60))
+
+        def _get(name, sign):
+            # ค่าที่หันไปด้านนั้นลบด้วยค่ากลางแล้วเอาทิศให้ถูก (ซ้าย/ก้มเป็นลบ)
+            if name not in avg or "center" not in avg: return None
+            if sign == "yaw":
+                return avg[name]["yaw"] - avg["center"]["yaw"]
+            else:
+                return avg[name]["pitch"] - avg["center"]["pitch"]
+
+        yaw_L = _get("left","yaw")
+        yaw_R = _get("right","yaw")
+        pit_U = _get("up","pitch")
+        pit_D = _get("down","pitch")
+
+        # ทำให้สัญญาณถูกต้อง: L(-), R(+), D(-), U(+)
+        if yaw_L is not None: yaw_L = float(yaw_L)
+        if yaw_R is not None: yaw_R = float(yaw_R)
+        if pit_U is not None: pit_U = float(pit_U)
+        if pit_D is not None: pit_D = float(pit_D)
+
+        def set_if(v, default):
+            return v if v is not None and not math.isnan(v) else default
+
+        # สร้าง threshold แบบสมมาตรโดยใช้ค่าที่น้อยกว่า (เพื่อให้เข้าเงื่อนไขง่ายเท่ากันสองข้าง)
+        if yaw_L is not None and yaw_R is not None:
+            yaw_enter = min(abs(yaw_L), abs(yaw_R)) * ENTER_RATIO
+            CFG["YAW_ENTER_DEG"] = float(max(5.0, yaw_enter))
+            CFG["YAW_EXIT_DEG"]  = float(max(3.0, CFG["YAW_ENTER_DEG"] * EXIT_RATIO))
+
+        if pit_U is not None:
+            CFG["PITCH_UP_ENTER_DEG"] = float(max(5.0, pit_U * ENTER_RATIO))
+            CFG["PITCH_UP_EXIT_DEG"]  = float(max(3.0, CFG["PITCH_UP_ENTER_DEG"] * EXIT_RATIO))
+        if pit_D is not None:
+            CFG["PITCH_DOWN_ENTER_DEG"] = float(min(-5.0, pit_D * ENTER_RATIO))  # เป็นค่าลบ
+            CFG["PITCH_DOWN_EXIT_DEG"]  = float(CFG["PITCH_DOWN_ENTER_DEG"] * EXIT_RATIO)  # ใกล้ศูนย์ขึ้น (ค่าลบน้อยลง)
+
+        save_cfg()
+        self.active = False
+
+    def hint(self):
+        if not self.active: return None
+        step = self.current_step()
+        if step == "center": return "คาลิเบรต: มอง 'ตรง' ศีรษะปกติ…"
+        if step == "left":   return "คาลิเบรต: หัน 'ซ้าย' ค้าง…"
+        if step == "right":  return "คาลิเบรต: หัน 'ขวา' ค้าง…"
+        if step == "up":     return "คาลิเบรต: 'เงยหน้า' ค้าง…"
+        if step == "down":   return "คาลิเบรต: 'ก้มหน้า' ค้าง…"
+        return None
+
+# ---------------- Main ----------------
 def main():
-    use_mirror   = True
-    show_points  = True
-    stream_json  = False
-    save_json_on_change = False
-    last_export  = None
+    load_cfg()
+
+    # OpenCV perf on Pi
+    cv2.setUseOptimized(True)
+    try: cv2.setNumThreads(2)
+    except: pass
 
     cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
     cap.set(cv2.CAP_PROP_FPS,         TARGET_FPS)
     cap.set(cv2.CAP_PROP_BUFFERSIZE,  1)
+    # ใช้ MJPG ลดภาระ CPU (ถ้ากล้องรองรับ)
+    try:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    except: pass
     if not cap.isOpened(): raise SystemExit("Cannot open camera")
 
     landmarker = build_landmarker(MODEL_PATH)
-    t0 = time.perf_counter()
+    t0 = time.perf_counter(); last_t = t0; fps = 0.0
 
-    # --- states ---
+    # states
     yaw_deg_ema = pitch_deg_ema = roll_deg_ema = None
     eye_w_ema = None; baseline_eye_w = None
     yaw_state, pitch_state = "center", "neutral"
-    yaw_bias = 0.0; pitch_bias = 0.0
-    # bias ชดเชยมุมกล้อง (เริ่มจากค่าคงที่ด้านบน)
-    cam_roll_bias_deg = float(CAMERA_ROLL_DEG)
     cmd_hist = deque(maxlen=5)
 
-    # smooth speed
     current_left_speed = current_right_speed = 0.0
     target_left_speed  = target_right_speed  = 0.0
-    SPEED_STEP = 10
+
+    stream_json = False; save_json_on_change = False; last_export = None
+
+    calib = GuidedCalib()
 
     while True:
         cap.grab()
         ok, frame = cap.read()
         if not ok: break
-        if use_mirror: frame = cv2.flip(frame, 1)
+        if CFG["mirror"]: frame = cv2.flip(frame, 1)
         h, w = frame.shape[:2]
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -136,10 +283,11 @@ def main():
 
         out = frame.copy()
 
-        # defaults
         command_key="idle"; turn_key="center"; pitch_key="neutral"; depth_key=None
         command_th="คำสั่ง: -"; turn_th="หัน: -"; pitch_th="ก้ม/เงย: -"; depth_th="ระยะ: -"
         color=(0,255,255)
+
+        yaw_c = pitch_c = roll_corr = None
 
         if result and result.face_landmarks:
             lm = result.face_landmarks[0]
@@ -159,50 +307,48 @@ def main():
             okp, rvec, tvec = cv2.solvePnP(MODEL_3D, pts2d, camM, dist, flags=cv2.SOLVEPNP_ITERATIVE)
             if okp:
                 R,_ = cv2.Rodrigues(rvec)
-
-                # --- ชดเชยมุมกล้องเอียง: หมุนแกนกล้องกลับด้วย -cam_roll_bias ---
-                R_corr = Rz_deg(-cam_roll_bias_deg) @ R
-
-                # ดึง Euler หลังชดเชยแล้ว
+                # ชดเชยมุมกล้องเอียง
+                R_corr = Rz_deg(-CFG["camera_roll_deg"]) @ R
                 pitch_deg, yaw_deg, roll_deg = rot_to_euler_deg(R_corr)
 
                 # smoothing
-                yaw_deg_ema   = ema(yaw_deg_ema,   yaw_deg)
-                pitch_deg_ema = ema(pitch_deg_ema, pitch_deg)
-                roll_deg_ema  = ema(roll_deg_ema,  roll_deg)
+                yaw_deg_ema   = ema(yaw_deg_ema,   yaw_deg, CFG["EMA_A"])
+                pitch_deg_ema = ema(pitch_deg_ema, pitch_deg, CFG["EMA_A"])
+                roll_deg_ema  = ema(roll_deg_ema,  roll_deg, CFG["EMA_A"])
 
-                # ลบ bias ส่วนบุคคล (ศีรษะปกติ)
-                yaw_c   = yaw_deg_ema   - yaw_bias
-                pitch_c = pitch_deg_ema - pitch_bias
+                # bias ส่วนบุคคล
+                yaw_c   = yaw_deg_ema   - CFG["yaw_bias"]
+                pitch_c = pitch_deg_ema - CFG["pitch_bias"]
+                roll_corr = roll_deg_ema  # แล้วแต่จะโชว์
 
-                # hysteresis: yaw
+                # hysteresis yaw
                 if yaw_state=="center":
-                    if yaw_c <= -YAW_ENTER_DEG: yaw_state="right"
-                    elif yaw_c >=  YAW_ENTER_DEG: yaw_state="left"
+                    if yaw_c <= -CFG["YAW_ENTER_DEG"]: yaw_state="right"
+                    elif yaw_c >=  CFG["YAW_ENTER_DEG"]: yaw_state="left"
                 elif yaw_state=="left":
-                    if yaw_c <  YAW_EXIT_DEG: yaw_state="center"
+                    if yaw_c <  CFG["YAW_EXIT_DEG"]: yaw_state="center"
                 elif yaw_state=="right":
-                    if yaw_c > -YAW_EXIT_DEG: yaw_state="center"
+                    if yaw_c > -CFG["YAW_EXIT_DEG"]: yaw_state="center"
 
-                # hysteresis: pitch
+                # hysteresis pitch
                 if pitch_state=="neutral":
-                    if   pitch_c >=  PITCH_UP_ENTER_DEG:     pitch_state="up"
-                    elif pitch_c <= PITCH_DOWN_ENTER_DEG:    pitch_state="down"
+                    if   pitch_c >=  CFG["PITCH_UP_ENTER_DEG"]:   pitch_state="up"
+                    elif pitch_c <= CFG["PITCH_DOWN_ENTER_DEG"]:  pitch_state="down"
                 elif pitch_state=="up":
-                    if   pitch_c <   PITCH_UP_EXIT_DEG:      pitch_state="neutral"
+                    if   pitch_c <   CFG["PITCH_UP_EXIT_DEG"]:    pitch_state="neutral"
                 elif pitch_state=="down":
-                    if   pitch_c >   PITCH_DOWN_EXIT_DEG:    pitch_state="neutral"
+                    if   pitch_c >   CFG["PITCH_DOWN_EXIT_DEG"]:  pitch_state="neutral"
 
-                # depth (eye width ratio)
+                # depth
                 eye_w = np.hypot(pts2d[2,0]-pts2d[3,0], pts2d[2,1]-pts2d[3,1])
-                eye_w_ema = ema(eye_w_ema, eye_w)
+                eye_w_ema = ema(eye_w_ema, eye_w, CFG["EMA_A"])
                 if baseline_eye_w and eye_w_ema:
                     ratio = eye_w_ema / baseline_eye_w
-                    if   ratio >= 1.0+DEPTH_DELTA: depth_th, depth_key = "ระยะ: ใกล้ขึ้น", "near"
-                    elif ratio <= 1.0-DEPTH_DELTA: depth_th, depth_key = "ระยะ: ไกลออก", "far"
-                    else:                           depth_th, depth_key = "ระยะ: คงที่", "neutral"
+                    if   ratio >= 1.0+CFG["DEPTH_DELTA"]: depth_th, depth_key = "ระยะ: ใกล้ขึ้น", "near"
+                    elif ratio <= 1.0-CFG["DEPTH_DELTA"]: depth_th, depth_key = "ระยะ: ไกลออก", "far"
+                    else:                                   depth_th, depth_key = "ระยะ: คงที่", "neutral"
 
-                # สรุปคำสั่ง
+                # คำสั่ง
                 turn_key = "left" if yaw_state=="left" else "right" if yaw_state=="right" else "center"
                 turn_th  = "หัน: ซ้าย" if turn_key=="left" else "หัน: ขวา" if turn_key=="right" else "หัน: ตรง"
                 if   pitch_state=="up":   command_key, command_th, color = "stop",    "คำสั่ง: หยุด",(0,200,255)
@@ -212,102 +358,136 @@ def main():
                     elif turn_key=="right": command_key, command_th, color = "right", "คำสั่ง: ไปขวา",(0,200,255)
                     else:                    command_key, command_th, color = "idle",  "คำสั่ง: คงที่",(0,255,255)
 
-                # เป้าหมายความเร็ว
+                # speed
+                def chase(cur, tgt, step):
+                    if cur < tgt:  return min(cur+step, tgt)
+                    if cur > tgt:  return max(cur-step, tgt)
+                    return cur
                 if   command_key=="forward": target_left_speed, target_right_speed = 100, 100
                 elif command_key=="left":    target_left_speed, target_right_speed =   0, 100
                 elif command_key=="right":   target_left_speed, target_right_speed = 100,   0
                 else:                        target_left_speed, target_right_speed =   0,   0
-
-                # ไล่ความเร็วเนียน ๆ
-                def chase(cur, tgt):
-                    if cur < tgt:  return min(cur+SPEED_STEP, tgt)
-                    if cur > tgt:  return max(cur-SPEED_STEP, tgt)
-                    return cur
-                current_left_speed  = chase(current_left_speed,  target_left_speed)
-                current_right_speed = chase(current_right_speed, target_right_speed)
+                current_left_speed  = chase(current_left_speed,  target_left_speed,  CFG["SPEED_STEP"])
+                current_right_speed = chase(current_right_speed, target_right_speed, CFG["SPEED_STEP"])
 
                 cmd_hist.append(command_key)
                 command_key = max(set(cmd_hist), key=cmd_hist.count)
 
-                # จุดอ้างอิงเล็ก ๆ
-                if show_points:
+                # จุดเล็กๆ (เบา CPU)
+                if CFG["show_points"]:
                     for p in (IDX_NOSE, IDX_CHIN, IDX_LEFT_EYE_OUT, IDX_RIGHT_EYE_OUT, IDX_LEFT_MOUTH, IDX_RIGHT_MOUTH):
                         cx, cy = int(lm[p].x*w), int(lm[p].y*h)
                         cv2.circle(out, (cx,cy), 2, (0,255,0), -1, cv2.LINE_AA)
 
-                # debug txt
-                txt = f"yaw:{yaw_c:+.1f}°  pitch:{pitch_c:+.1f}°  roll_corr:{(roll_deg_ema or 0):+.1f}°  cam_roll_bias:{cam_roll_bias_deg:+.1f}°"
-                out = draw_text_thai(out, txt, (10,24), 22, (0,255,0), 2)
+        # ---------- Calibration feed ----------
+        if calib.active and yaw_c is not None and pitch_c is not None:
+            if eye_w_ema is not None and baseline_eye_w is not None:
+                base_ratio = baseline_eye_w
+            else:
+                base_ratio = np.nan
+            calib.feed(yaw_c, pitch_c, roll_corr if roll_corr is not None else 0.0,
+                       eye_w_ema if eye_w_ema is not None else 0.0,
+                       baseline_eye_w if baseline_eye_w is not None else np.nan)
 
         # ---------- UI ----------
-        out = draw_panel(out, (8, 90), (w-8, 150), (0,0,0), 0.6)
+        now = time.perf_counter()
+        dt = now - last_t
+        if dt > 0.0:
+            fps = 0.9*fps + 0.1*(1.0/dt)
+        last_t = now
+
+        if CFG["perf_overlay"]:
+            cv2.line(out, (w//2,0), (w//2,h), (90,90,90), 1, cv2.LINE_AA)
+            cv2.line(out, (0,h//2), (w,h//2), (90,90,90), 1, cv2.LINE_AA)
+
+        panel_h = 60 if not CFG["perf_overlay"] else 150
+        out = draw_panel(out, (8, 90), (w-8, 90+panel_h), (0,0,0), 0.55)
         out = draw_text_thai(out, command_th, (16, 100), 36, color, 2, (0,0,0))
 
-        out = draw_panel(out, (8, 154), (w-8, 270), (0,0,0), 0.45)
-        out = draw_text_thai(out, turn_th,  (16,160), 26, (255,255,0), 2, (0,0,0))
-        out = draw_text_thai(out, pitch_th, (16,188), 26, (255,255,0), 2, (0,0,0))
-        out = draw_text_thai(out, depth_th, (16,216), 26, (255,255,0), 2, (0,0,0))
+        if CFG["perf_overlay"]:
+            info1 = f"yaw:{(yaw_c if yaw_c is not None else 0):+.1f}°  pitch:{(pitch_c if pitch_c is not None else 0):+.1f}°  rollBias:{CFG['camera_roll_deg']:+.1f}°  fps:{fps:.1f}"
+            out = draw_text_thai(out, info1, (16, 140), 22, (0,255,0), 2)
 
-        speed_text = f"ความเร็ว: ซ้าย {int(current_left_speed):3d} ขวา {int(current_right_speed):3d}"
-        out = draw_text_thai(out, speed_text, (16,244), 26, (0,255,255), 2, (0,0,0))
+            out = draw_panel(out, (8, 154), (w-8, 270), (0,0,0), 0.45)
+            out = draw_text_thai(out, ("หัน: ซ้าย" if turn_key=="left" else "หัน: ขวา" if turn_key=="right" else "หัน: ตรง"),  (16,160), 26, (255,255,0), 2, (0,0,0))
+            out = draw_text_thai(out, ("ก้ม/เงย: เงยหน้า" if pitch_state=="up" else "ก้ม/เงย: ก้มหน้า" if pitch_state=="down" else "ก้ม/เงย: ปกติ"), (16,188), 26, (255,255,0), 2, (0,0,0))
+            out = draw_text_thai(out, depth_th, (16,216), 26, (255,255,0), 2, (0,0,0))
+            speed_text = f"ความเร็ว: ซ้าย {int(current_left_speed):3d} ขวา {int(current_right_speed):3d}"
+            out = draw_text_thai(out, speed_text, (16,244), 26, (0,255,255), 2, (0,0,0))
 
-        bias_text  = f"Bias: yaw {yaw_bias:+.1f}° | pitch {pitch_bias:+.1f}° | cam_roll {cam_roll_bias_deg:+.1f}°"
-        out = draw_text_thai(out, bias_text, (16,268), 22, (180,220,255), 2, (0,0,0))
+            bias_text  = f"Bias yaw {CFG['yaw_bias']:+.1f}° | pitch {CFG['pitch_bias']:+.1f}° | cam_roll {CFG['camera_roll_deg']:+.1f}°"
+            out = draw_text_thai(out, bias_text, (16,268), 22, (180,220,255), 2, (0,0,0))
 
-        help_text = "q:ออก | c:คาลิเบรตทั้งหมด | h:คาลิเบรตกล้องเอียง | a/d,yaw  w/s,pitch  z/x,roll | f:กระจก | m:จุด | j:JSON | k:Save JSON | r:รีเซ็ต"
-        out = draw_text_thai(out, help_text, (16, h-32), 22, (200,200,200), 1, (0,0,0))
+        # คำแนะนำคาลิเบรตนำทาง
+        if calib.active:
+            hint = calib.hint()
+            if hint:
+                out = draw_panel(out, (8, 8), (w-8, 60), (20,20,20), 0.75)
+                out = draw_text_thai(out, hint + " (รอ 40 เฟรม…)", (16, 18), 28, (0,255,255), 2)
 
-        # เส้นไกด์
-        cv2.line(out, (w//2,0), (w//2,h), (90,90,90), 1, cv2.LINE_AA)
-        cv2.line(out, (0,h//2), (w,h//2), (90,90,90), 1, cv2.LINE_AA)
+        help_text = "q:ออก | g:คาลิเบรตนำทาง | c:คาลิเบรตเร็ว | h:คาลิเบรตกล้องเอียง | a/d,yaw  w/s,pitch  z/x,roll | f:กระจก | m:จุด | p:UIเบา | j:JSON | k:Save | r:รีเซ็ต"
+        out = draw_text_thai(out, help_text, (16, h-32), 20, (200,200,200), 1, (0,0,0))
 
         cv2.imshow("Face Landmarker (Pi) - q to quit", out)
 
         # ---------- Keys ----------
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'): break
-        elif key == ord('f'): use_mirror = not use_mirror
-        elif key == ord('m'): show_points = not show_points
+        elif key == ord('f'): CFG["mirror"] = not CFG["mirror"]; save_cfg()
+        elif key == ord('m'): CFG["show_points"] = not CFG["show_points"]; save_cfg()
+        elif key == ord('p'): CFG["perf_overlay"] = not CFG["perf_overlay"]; save_cfg()
         elif key == ord('j'): stream_json  = not stream_json
         elif key == ord('k'): save_json_on_change = not save_json_on_change
         elif key == ord('r'):
-            eye_w_ema = None; baseline_eye_w = None
             yaw_deg_ema = pitch_deg_ema = roll_deg_ema = None
-            yaw_state="center"; pitch_state="neutral"
-            yaw_bias=pitch_bias=0.0
-            cam_roll_bias_deg = float(CAMERA_ROLL_DEG)
+            eye_w_ema = None; baseline_eye_w = None
+            yaw_state, pitch_state = "center", "neutral"
             cmd_hist.clear()
-            current_left_speed=current_right_speed=0.0
-            target_left_speed=target_right_speed=0.0
+            current_left_speed = current_right_speed = 0.0
+            target_left_speed  = target_right_speed  = 0.0
         elif key == ord('c'):
-            # คาลิเบรตทั้งหมด ณ ท่าปกติ (ชดเชยกล้องเอียงด้วย)
-            if eye_w_ema:        baseline_eye_w = float(eye_w_ema)
-            if yaw_deg_ema:      yaw_bias   = float(yaw_deg_ema)
-            if pitch_deg_ema:    pitch_bias = float(pitch_deg_ema)
-            if roll_deg_ema is not None:
-                cam_roll_bias_deg = float(cam_roll_bias_deg + (roll_deg_ema))  # auto-align horizon
+            # คาลิเบรตเร็ว ณ ท่าปัจจุบัน
+            if eye_w_ema is not None: baseline_eye_w = float(eye_w_ema)
+            if yaw_deg_ema is not None:   CFG["yaw_bias"]   = float(yaw_deg_ema)
+            if pitch_deg_ema is not None: CFG["pitch_bias"] = float(pitch_deg_ema)
+            if roll_deg_ema is not None:  CFG["camera_roll_deg"] = float(CFG["camera_roll_deg"] + roll_deg_ema)
+            save_cfg()
         elif key == ord('h'):
-            # คาลิเบรตเฉพาะ camera roll
             if roll_deg_ema is not None:
-                cam_roll_bias_deg = float(cam_roll_bias_deg + (roll_deg_ema))
+                CFG["camera_roll_deg"] = float(CFG["camera_roll_deg"] + roll_deg_ema)
+                save_cfg()
+        elif key == ord('g'):
+            # เริ่มคาลิเบรตนำทาง
+            if eye_w_ema is not None: baseline_eye_w = float(eye_w_ema)
+            calib.start()
         # จูนละเอียด bias
-        elif key == ord('a'): yaw_bias   -= 1.0
-        elif key == ord('d'): yaw_bias   += 1.0
-        elif key == ord('w'): pitch_bias -= 1.0
-        elif key == ord('s'): pitch_bias += 1.0
-        elif key == ord('z'): cam_roll_bias_deg -= 1.0
-        elif key == ord('x'): cam_roll_bias_deg += 1.0
+        elif key == ord('a'): CFG["yaw_bias"]   -= 1.0; save_cfg()
+        elif key == ord('d'): CFG["yaw_bias"]   += 1.0; save_cfg()
+        elif key == ord('w'): CFG["pitch_bias"] -= 1.0; save_cfg()
+        elif key == ord('s'): CFG["pitch_bias"] += 1.0; save_cfg()
+        elif key == ord('z'): CFG["camera_roll_deg"] -= 1.0; save_cfg()
+        elif key == ord('x'): CFG["camera_roll_deg"] += 1.0; save_cfg()
+
+        # ตั้ง baseline ระยะครั้งแรกอัตโนมัติหลังเปิด (เมื่อภาพนิ่งขึ้น)
+        if baseline_eye_w is None and eye_w_ema is not None:
+            baseline_eye_w = float(eye_w_ema)
 
         # ---------- JSON ----------
         status = {
             "command": command_key, "turn": turn_key, "pitch": pitch_key, "depth": depth_key,
-            "yaw_deg":   round(float(yaw_deg_ema - yaw_bias),1) if yaw_deg_ema   is not None else None,
-            "pitch_deg": round(float(pitch_deg_ema - pitch_bias),1) if pitch_deg_ema is not None else None,
+            "yaw_deg":   round(float(yaw_c),1) if yaw_c is not None else None,
+            "pitch_deg": round(float(pitch_c),1) if pitch_c is not None else None,
             "eye_ratio": round(float(eye_w_ema)/float(baseline_eye_w),3) if (baseline_eye_w and eye_w_ema) else None,
             "calibrated": baseline_eye_w is not None,
             "left_speed": int(current_left_speed), "right_speed": int(current_right_speed),
             "target_left_speed": int(target_left_speed), "target_right_speed": int(target_right_speed),
-            "cam_roll_bias_deg": round(float(cam_roll_bias_deg),1)
+            "cam_roll_bias_deg": round(float(CFG["camera_roll_deg"]),1),
+            "fps": round(float(fps),1),
+            "thresholds": {
+                "yaw_enter": CFG["YAW_ENTER_DEG"], "yaw_exit": CFG["YAW_EXIT_DEG"],
+                "pitch_up_enter": CFG["PITCH_UP_ENTER_DEG"], "pitch_up_exit": CFG["PITCH_UP_EXIT_DEG"],
+                "pitch_down_enter": CFG["PITCH_DOWN_ENTER_DEG"], "pitch_down_exit": CFG["PITCH_DOWN_EXIT_DEG"],
+            }
         }
         if stream_json:
             try: print(json.dumps(status, ensure_ascii=False), flush=True)
@@ -319,7 +499,17 @@ def main():
                 last_export = status
             except: pass
 
+        # จบคาลิเบรตนำทางเมื่อครบทุกขั้น
+        if calib.active and calib.current_step() is None:
+            calib.finish()  # เผื่อยังไม่เรียก
+            # รีเฟรช hysteresis จาก CFG ที่เพิ่งบันทึก
+            pass
+
     cap.release(); cv2.destroyAllWindows()
 
 if __name__ == "__main__":
+    # เช็คโมเดล
+    if not os.path.exists(MODEL_PATH):
+        print(f"ไม่พบโมเดล: {MODEL_PATH}", file=sys.stderr)
+        sys.exit(1)
     main()
